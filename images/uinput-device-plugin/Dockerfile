@@ -38,7 +38,7 @@ RUN go build -o uinput_helper cmd/uinput_helper/*.go
 RUN chmod a+x uinput_plugin uinput_monitor uinput_helper
 
 # Copy binaries to thin image.
-FROM python:3-stretch
+FROM python:3
 COPY --from=builder /go/src/github.com/danisla/uinput-device-plugin/uinput_plugin /usr/bin/uinput-device-plugin
 COPY --from=builder /go/src/github.com/danisla/uinput-device-plugin/uinput_monitor /usr/bin/uinput-monitor
 COPY --from=builder /go/src/github.com/danisla/uinput-device-plugin/uinput_helper /usr/bin/uinput-helper

@@ -35,4 +35,4 @@ resources:
   - uinput-device-plugin.yaml
 
 patches:
-  - patch-disable-uinput.yaml
+  - path: patch-disable-uinput.yaml

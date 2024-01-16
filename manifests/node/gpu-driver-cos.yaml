@@ -74,53 +74,26 @@ spec:
         - name: dev
           hostPath:
             path: /dev
+        - name: vulkan-icd-mount
+          hostPath:
+            path: /home/kubernetes/bin/nvidia/vulkan/icd.d
         - name: nvidia-install-dir-host
           hostPath:
             path: /home/kubernetes/bin/nvidia
         - name: root-mount
           hostPath:
             path: /
-        - name: config
-          configMap:
-            name: gpu-driver-cos
-            defaultMode: 0755
+        - name: cos-tools
+          hostPath:
+            path: /var/lib/cos-tools
+        - name: nvidia-config
+          hostPath:
+            path: /etc/nvidia
         - name: host-kubectl
           hostPath:
             path: /home/kubernetes/bin/kubectl
             type: File
       initContainers:
-        ###
-        # Attempt to download cached nvidia driver from GCS
-        ###
-        - image: "cos-nvidia-installer:fixed"
-          imagePullPolicy: Never
-          name: nvidia-driver-cache-download
-          resources:
-            requests:
-              cpu: 0.15
-          securityContext:
-            privileged: true
-          command: ["/bin/bash"]
-          args:
-            - -xc
-            - |
-              . /hostfs/etc/os-release
-              PROJECT_ID=$(curl -sf -H "Metadata-Flavor: Google"  http://metadata.google.internal/computeMetadata/v1/project/project-id)
-              TOKEN=$(curl -sf -H "Metadata-Flavor: Google"  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token | tr ',' '\n' | grep access_token | cut -d: -f2 | tr -d '"')
-              URL="https://storage.googleapis.com/${PROJECT_ID}-vdi/drivers/NVIDIA-driver-cached-cos-${VERSION_ID}-${BUILD_ID}-nvidia-${NVIDIA_DRIVER_VERSION}.tar.gz"
-              (cd /usr/local/ && curl -sfL -H "Authorization: Bearer $TOKEN" $URL | tar -zxvf -) || \
-                echo "WARN: Cache driver not found, driver will be built from source and cached afterwards."
-          env:
-            - name: NVIDIA_DRIVER_VERSION
-              valueFrom:
-                configMapKeyRef:
-                  name: gpu-driver-cos
-                  key: nvidia_driver_version
-          volumeMounts:
-            - name: root-mount
-              mountPath: /hostfs
-            - name: nvidia-install-dir-host
-              mountPath: /usr/local/nvidia
         ###
         # Install NVIDIA driver from cache or build from source
         ###
@@ -129,119 +102,64 @@ spec:
           name: nvidia-driver-installer
           resources:
             requests:
-              cpu: 0.15
+              cpu: 150m
           securityContext:
             privileged: true
-          command: ["/entrypoint.sh"]
           env:
             - name: NVIDIA_INSTALL_DIR_HOST
               value: /home/kubernetes/bin/nvidia
             - name: NVIDIA_INSTALL_DIR_CONTAINER
               value: /usr/local/nvidia
+            - name: VULKAN_ICD_DIR_HOST
+              value: /home/kubernetes/bin/nvidia/vulkan/icd.d
+            - name: VULKAN_ICD_DIR_CONTAINER
+              value: /etc/vulkan/icd.d
             - name: ROOT_MOUNT_DIR
               value: /root
-            - name: NVIDIA_DRIVER_VERSION
-              valueFrom:
-                configMapKeyRef:
-                  name: gpu-driver-cos
-                  key: nvidia_driver_version
+            - name: COS_TOOLS_DIR_HOST
+              value: /var/lib/cos-tools
+            - name: COS_TOOLS_DIR_CONTAINER
+              value: /build/cos-tools
           volumeMounts:
             - name: nvidia-install-dir-host
               mountPath: /usr/local/nvidia
+            - name: vulkan-icd-mount
+              mountPath: /etc/vulkan/icd.d
             - name: dev
               mountPath: /dev
             - name: root-mount
               mountPath: /root
-            - name: config
-              mountPath: /gpu_installer_url_lib.sh
-              subPath: gpu_installer_url_lib.sh
-            - name: config
-              mountPath: /entrypoint.sh
-              subPath: entrypoint.sh
-        ###
-        # Install CUDA runtime
-        # Skips install if libraries are found in cache.
-        # Required for GStreamer cuda elements
-        ###
-        - name: cuda-nvrtc-install
-          image: "cos-nvidia-installer:fixed"
-          imagePullPolicy: Never
-          securityContext:
-            privileged: true
-          volumeMounts:
-            - name: root-mount
-              mountPath: /usr/local/nvidia
-              subPath: home/kubernetes/bin/nvidia
-          command: ["/bin/bash"]
-          args:
-            - -exc
+            - name: cos-tools
+              mountPath: /build/cos-tools
+          command:
+            - bash
+            - -c
             - |
-              # Install CUDA libraries
-              # NOTE the cuda package version must match the cuda driver version from the nvidia-smi output.
-              # CUDA driver and forward compatibility version matrix:
-              #   https://docs.nvidia.com/deploy/cuda-compatibility/#deployment-consideration-forward
-
-              CUDA_LIB_DIR=/usr/local/nvidia/cuda/lib64
-              [[ -d ${CUDA_LIB_DIR} ]] && echo "INFO: CUDA libs already installed." && exit 0
-
-              apt-get update
-              apt-get install -y gnupg rsync
-
-              CUDA_SRC_DIR=""
-              CUDA_COMPAT_DIR=""
-
-              IFS="." read -ra VERSION_TOKS <<< ${NVIDIA_DRIVER_VERSION}
-              if [[ ${VERSION_TOKS[0]} -ge 470 ]]; then
-                echo "Installing CUDA 11.4 with 11.7 compat libs"
-                apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/7fa2af80.pub
-                curl -LO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-nvrtc-11-4_11.4.152-1_amd64.deb
-                curl -LO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-nvrtc-dev-11-4_11.4.152-1_amd64.deb
-                curl -LO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-compat-11-7_515.65.01-1_amd64.deb
-
-                dpkg -i cuda-nvrtc-11-4_11.4.152-1_amd64.deb
-                dpkg -i cuda-nvrtc-dev-11-4_11.4.152-1_amd64.deb
-                dpkg -i cuda-compat-11-7_515.65.01-1_amd64.deb
-                CUDA_SRC_DIR="/usr/local/cuda-11.4/lib64"
-                CUDA_COMPAT_DIR="/usr/local/cuda-11.7/compat"
-              elif [[ ${VERSION_TOKS[0]} -ge 460 ]]; then
-                echo "Installing CUDA 11.2"
-                apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/7fa2af80.pub
-                curl -LO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-nvrtc-11-2_11.2.152-1_amd64.deb
-                curl -LO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-nvrtc-dev-11-2_11.2.152-1_amd64.deb
-                dpkg -i cuda-nvrtc-11-2_11.2.152-1_amd64.deb
-                dpkg -i cuda-nvrtc-dev-11-2_11.2.152-1_amd64.deb
-                CUDA_SRC_DIR="/usr/local/cuda-11.2/lib64"
+              echo "Checking for existing GPU driver modules"
+              if lsmod | grep nvidia; then
+                echo "GPU driver is already installed, the installed version may or may not be the driver version being tried to install, skipping installation"
+                exit 0
               else
-                echo "Installing CUDA 10.1"
-                apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1404/x86_64/7fa2af80.pub
-                curl -LO http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1404/x86_64/cuda-repo-ubuntu1404_10.1.243-1_amd64.deb
-                dpkg -i cuda-repo-ubuntu1404_10.1.243-1_amd64.deb
-                apt-get update
-                apt-get install -y cuda-nvrtc-dev-10-1
-                CUDA_SRC_DIR="/usr/local/cuda-10.1/lib64"
+                echo "No GPU driver module detected, installing now"
+                /cos-gpu-installer install
               fi
-
-              if [[ -n ${CUDA_SRC_DIR} && $(ls -l ${CUDA_SRC_DIR}/* | wc -l) -gt 0 ]]; then
-                mkdir -p ${CUDA_LIB_DIR}
-                rsync -ra ${CUDA_SRC_DIR?}/* ${CUDA_LIB_DIR}
-              else
-                echo "WARN: no cuda libs found in source dir: ${CUDA_SRC_DIR}"
-              fi
-
-              if [[ -n ${CUDA_COMPAT_DIR} && $(ls -l ${CUDA_COMPAT_DIR}/* | wc -l) -gt 0 ]]; then
-                mkdir -p ${CUDA_LIB_DIR}/compat
-                rsync -ra ${CUDA_COMPAT_DIR?}/* ${CUDA_LIB_DIR}/compat
-              else
-                echo "WARN: no cuda compat libs found in source dir: ${CUDA_COMPAT_DIR}"
-              fi
-
-              touch /tmp/cuda_install_complete
-          env:
-            - name: NVIDIA_DRIVER_VERSION
-              valueFrom:
-                configMapKeyRef:
-                  name: gpu-driver-cos
-                  key: nvidia_driver_version
+        # - image: "gcr.io/gke-release/nvidia-partition-gpu@sha256:e226275da6c45816959fe43cde907ee9a85c6a2aa8a429418a4cadef8ecdb86a"
+        #   name: partition-gpus
+        #   env:
+        #     - name: LD_LIBRARY_PATH
+        #       value: /usr/local/nvidia/lib64
+        #   resources:
+        #     requests:
+        #       cpu: 150m
+        #   securityContext:
+        #     privileged: true
+        #   volumeMounts:
+        #     - name: nvidia-install-dir-host
+        #       mountPath: /usr/local/nvidia
+        #     - name: dev
+        #       mountPath: /dev
+        #     - name: nvidia-config
+        #       mountPath: /etc/nvidia
         ###
         # Remove taint and update node label.
         ###
@@ -265,45 +183,6 @@ spec:
           volumeMounts:
             - name: host-kubectl
               mountPath: /usr/local/bin/kubectl
-        ###
-        # Upload cached driver to GCS
-        ###
-        - name: nvidia-driver-cache-upload
-          image: google/cloud-sdk:alpine
-          command: ["/bin/bash"]
-          args:
-            - -exc
-            - |
-              . /hostfs/etc/os-release
-              PROJECT_ID=$(curl -sf -H "Metadata-Flavor: Google"  http://metadata.google.internal/computeMetadata/v1/project/project-id)
-              BUCKET=gs://${PROJECT_ID}-vdi
-              DEST_FILE=NVIDIA-driver-cached-cos-${VERSION_ID}-${BUILD_ID}-nvidia-${NVIDIA_DRIVER_VERSION}.tar.gz
-              DEST_OBJ=${BUCKET}/drivers/${DEST_FILE}
-
-              # Exit if object already exists.
-              if [[ -n $(gsutil ls ${DEST_OBJ}) ]]; then
-                echo "INFO: cache archive already exists."
-                exit 0
-              fi
-
-              # Create bucket (ignore failure if bucket exists)
-              gsutil mb ${BUCKET} || true
-
-              # Create archive of driver contents
-              cd /hostfs/home/kubernetes/bin
-              tar -zcvf /tmp/${DEST_FILE} nvidia
-
-              # Copy archive to GCS
-              gsutil -m cp /tmp/${DEST_FILE} ${DEST_OBJ} || true
-          env:
-            - name: NVIDIA_DRIVER_VERSION
-              valueFrom:
-                configMapKeyRef:
-                  name: gpu-driver-cos
-                  key: nvidia_driver_version
-          volumeMounts:
-            - name: root-mount
-              mountPath: /hostfs
       containers:
         ###
         # Continuously apply the node label
